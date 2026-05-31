@@ -1,0 +1,80 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Represents an online participant's metadata and presence status",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "username": { "type": "string" },
+        "avatarColor": { "type": "string" },
+        "avatarEmoji": { "type": "string" },
+        "status": { "type": "string", "enum": ["online", "away", "offline"] },
+        "lastActive": { "type": "number" }
+      },
+      "required": ["id", "username", "avatarColor", "avatarEmoji", "status", "lastActive"]
+    },
+    "Channel": {
+      "title": "Discussion Channel",
+      "description": "A separate discussion room within the workspace",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "isPrivate": { "type": "boolean" }
+      },
+      "required": ["id", "name", "description"]
+    },
+    "Message": {
+      "title": "Chat Message",
+      "description": "A message sent in a channel by a participant",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "channelId": { "type": "string" },
+        "user": { "$ref": "#/entities/User" },
+        "content": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "imageUrl": { "type": "string" },
+        "reactions": {
+          "type": "array",
+          "description": "List of user emoji reactions on this message"
+        },
+        "isSystem": { "type": "boolean" }
+      },
+      "required": ["id", "channelId", "user", "content", "timestamp", "reactions"]
+    },
+    "TypingStatus": {
+      "title": "Typing Telemetry",
+      "description": "Indicates whether a specific user is currently drafting a message in a channel",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "username": { "type": "string" },
+        "channelId": { "type": "string" },
+        "isTyping": { "type": "boolean" },
+        "lastUpdated": { "type": "number" }
+      },
+      "required": ["userId", "username", "channelId", "isTyping", "lastUpdated"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "User online profiles and presence settings"
+    },
+    "channels/{channelId}": {
+      "schema": "Channel",
+      "description": "Discussion channels within the workspace"
+    },
+    "messages/{messageId}": {
+      "schema": "Message",
+      "description": "Chronological index of messages across channels"
+    },
+    "typing/{statusId}": {
+      "schema": "TypingStatus",
+      "description": "Active typing telemetry indicators for real-time room UI updates"
+    }
+  }
+}

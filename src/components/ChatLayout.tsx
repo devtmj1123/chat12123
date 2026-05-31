@@ -20,6 +20,17 @@ import {
   MessageSquare,
   AlertCircle
 } from "lucide-react";
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  updateDoc, 
+  onSnapshot, 
+  query, 
+  orderBy, 
+  getDocs
+} from "firebase/firestore";
+import { db, handleFirestoreError, OperationType } from "../utils/firebase";
 
 interface ChatLayoutProps {
   currentUser: User;
@@ -27,10 +38,8 @@ interface ChatLayoutProps {
 }
 
 export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout }) => {
-  // Websocket state
-  const [socket, setSocket] = useState<WebSocket | null>(null);
+  // Connection state indicating Firestore snapshot health
   const [connectionStatus, setConnectionStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
-  const [reconnectCount, setReconnectCount] = useState(0);
 
   // Core collections synced from server
   const [channels, setChannels] = useState<Channel[]>([]);
@@ -127,7 +136,7 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
     scrollToBottom("smooth");
   }, [activeChannelMessagesCount, lastMessageIdInActiveChannel, activeChannelId]);
 
-  // Synchronous refs to prevent stale closures inside WebSocket callbacks
+  // Synchronous refs to prevent stale closures inside callbacks
   const activeChannelIdRef = useRef(activeChannelId);
   const soundEnabledRef = useRef(soundEnabled);
 
@@ -139,164 +148,184 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
 
-  // Connect and manage WebSocket life-cycles
+  // 1. Presence registration system
   useEffect(() => {
-    let ws: WebSocket | null = null;
-    let isCleanup = false;
-
-    const connect = () => {
-      if (isCleanup) return;
-
-      setConnectionStatus("connecting");
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}`;
-      
-      ws = new WebSocket(wsUrl);
-
-      ws.onopen = () => {
-        if (isCleanup) {
-          ws?.close();
-          return;
-        }
-        setConnectionStatus("connected");
-        setReconnectCount(0);
-        
-        // Register current user onto the server
-        ws?.send(JSON.stringify({
-          type: "join",
-          user: currentUser
-        }));
-      };
-
-      ws.onmessage = (event) => {
-        if (isCleanup) return;
-        try {
-          const payload = JSON.parse(event.data);
-          if (!payload || !payload.type) return;
-
-          switch (payload.type) {
-            case "state-sync": {
-              setChannels(payload.channels || []);
-              setMessages(payload.messages || []);
-              setUsers(payload.users || []);
-              break;
-            }
-
-            case "channel-created": {
-              setChannels(prev => [...prev.filter(c => c.id !== payload.channel.id), payload.channel]);
-              break;
-            }
-
-            case "message": {
-              const newMsg = payload.message as Message;
-              setMessages(prev => {
-                // Deduplicate
-                if (prev.some(m => m.id === newMsg.id)) return prev;
-                return [...prev, newMsg];
-              });
-              break;
-            }
-
-            case "typing": {
-              const { userId, username, channelId, isTyping } = payload;
-              setTypingUsers(prev => {
-                const copy = { ...prev };
-                if (isTyping) {
-                  // Ignore self-typing events
-                  if (userId === currentUser.id) return prev;
-                  copy[userId] = { username, channelId };
-                } else {
-                  delete copy[userId];
-                }
-                return copy;
-              });
-              break;
-            }
-
-            case "reaction-update": {
-              const { messageId, reactions } = payload;
-              setMessages(prev => prev.map(m => {
-                if (m.id === messageId) {
-                  return { ...m, reactions };
-                }
-                return m;
-              }));
-              break;
-            }
-
-            case "presence": {
-              setUsers(payload.users || []);
-              break;
-            }
-
-            case "notification": {
-              const { title, message, channelId, userId } = payload;
-              // Only trigger notifications if message is not in the active pane, or tab is unfocused
-              if (userId !== currentUser.id && (channelId !== activeChannelIdRef.current || !isWindowFocused.current)) {
-                if (soundEnabledRef.current) {
-                  playChime();
-                }
-                // Push desktop notification
-                if (Notification.permission === "granted") {
-                  showDesktopNotification(title, { body: message });
-                }
-                // Flash tab title
-                if (!isWindowFocused.current) {
-                  startTabFlashing(`${title}: ${message}`);
-                }
-              }
-              break;
-            }
-
-            default:
-              break;
-          }
-        } catch (err) {
-          console.error("Failed to parse websocket message packet:", err);
-        }
-      };
-
-      ws.onclose = () => {
-        if (isCleanup) return;
-        setConnectionStatus("disconnected");
-        
-        // Reconnection mechanism with exponential backoff capped at 30 seconds
-        setReconnectCount(prev => {
-          const timeout = Math.min(1000 * Math.pow(2, prev), 30000);
-          setTimeout(() => {
-            if (!isCleanup) {
-              connect();
-            }
-          }, timeout);
-          return prev + 1;
-        });
-      };
-
-      setSocket(ws);
+    const userRef = doc(db, "users", currentUser.id);
+    
+    const refreshPresence = async () => {
+      try {
+        await setDoc(userRef, {
+          ...currentUser,
+          lastActive: Date.now()
+        }, { merge: true });
+      } catch (err) {
+        console.error("Presence check fails:", err);
+      }
     };
 
-    connect();
+    refreshPresence();
+    const presenceTimer = setInterval(refreshPresence, 20000);
 
     return () => {
-      isCleanup = true;
-      if (ws) {
-        ws.onclose = null;
-        ws.onerror = null;
-        ws.close();
-      }
+      clearInterval(presenceTimer);
+      // Try to gracefully mark away/offline on unmount
+      setDoc(userRef, {
+        status: "offline",
+        lastActive: Date.now()
+      }, { merge: true }).catch(err => console.log("Unmount presence update skipped:", err));
     };
   }, [currentUser]);
 
+  // 2. Synchronous subscriptions for channels, messages, users, and typing telemetry
+  useEffect(() => {
+    setConnectionStatus("connecting");
+
+    // Live Channels Sync
+    const unsubscribeChannels = onSnapshot(collection(db, "channels"), async (snapshot) => {
+      if (snapshot.empty) {
+        // Automatically seed default channels if database is fresh
+        const defaultChannels: Channel[] = [
+          { id: "general", name: "general", description: "Default channel for friendly workspace chit-chats." },
+          { id: "tech-corner", name: "tech-corner", description: "Code snippets, engineering design reviews, and modern tools." },
+          { id: "announcements", name: "announcements", description: "Broadcast board for official notifications and alerts." }
+        ];
+
+        try {
+          for (const ch of defaultChannels) {
+            await setDoc(doc(db, "channels", ch.id), ch);
+          }
+          // Seed system welcome message too
+          const systemMsg: Message = {
+            id: "system-welcome",
+            channelId: "general",
+            user: {
+              id: "system",
+              username: "System Butler",
+              avatarColor: "slate",
+              avatarEmoji: "🛎️",
+              status: "online",
+              lastActive: Date.now()
+            },
+            content: "Welcome to the real-time Workspace Chat App! Share links, upload screenshots/drawings, react to messages, or test push notifications.",
+            timestamp: Date.now(),
+            reactions: [],
+            isSystem: true
+          };
+          await setDoc(doc(db, "messages", systemMsg.id), systemMsg);
+        } catch (e) {
+          console.error("Failed to seed default database channels:", e);
+        }
+      } else {
+        const loadedChannels: Channel[] = [];
+        snapshot.docs.forEach((doc) => {
+          loadedChannels.push(doc.data() as Channel);
+        });
+        setChannels(loadedChannels);
+        setConnectionStatus("connected");
+      }
+    }, (err) => {
+      handleFirestoreError(err, OperationType.LIST, "channels");
+      setConnectionStatus("disconnected");
+    });
+
+    // Live Messages Sync
+    const messagesQuery = query(collection(db, "messages"), orderBy("timestamp", "asc"));
+    const unsubscribeMessages = onSnapshot(messagesQuery, (snapshot) => {
+      const loadedMessages: Message[] = [];
+      snapshot.docs.forEach((doc) => {
+        loadedMessages.push(doc.data() as Message);
+      });
+      setMessages(loadedMessages);
+    }, (err) => {
+      handleFirestoreError(err, OperationType.LIST, "messages");
+    });
+
+    // Live Users Sync
+    const unsubscribeUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+      const loadedUsers: User[] = [];
+      const now = Date.now();
+      snapshot.docs.forEach((doc) => {
+        const data = doc.data() as User;
+        // Mark stale users as offline (inactive for over 90 seconds)
+        const isStale = (now - data.lastActive) > 90000;
+        loadedUsers.push({
+          ...data,
+          status: isStale ? "offline" : data.status
+        });
+      });
+      setUsers(loadedUsers);
+    }, (err) => {
+      handleFirestoreError(err, OperationType.LIST, "users");
+    });
+
+    // Live Typing Sync
+    const unsubscribeTyping = onSnapshot(collection(db, "typing"), (snapshot) => {
+      const activeTyping: Record<string, { username: string; channelId: string }> = {};
+      const now = Date.now();
+      snapshot.docs.forEach((doc) => {
+        const data = doc.data();
+        if (data.isTyping && data.userId !== currentUser.id && (now - data.lastUpdated < 10000)) {
+          activeTyping[data.userId] = { username: data.username, channelId: data.channelId };
+        }
+      });
+      setTypingUsers(activeTyping);
+    }, (err) => {
+      console.warn("Typing subscription error:", err);
+    });
+
+    return () => {
+      unsubscribeChannels();
+      unsubscribeMessages();
+      unsubscribeUsers();
+      unsubscribeTyping();
+    };
+  }, [currentUser]);
+
+  // 3. Setup client notifications on real-time message changes
+  const initialLoadRef = useRef(true);
+  useEffect(() => {
+    if (messages.length === 0) return;
+    if (initialLoadRef.current) {
+      initialLoadRef.current = false;
+      return;
+    }
+
+    const latestMessage = messages[messages.length - 1];
+    if (!latestMessage) return;
+
+    // Verify message is very recent to avoid triggering popups on old backloaded chats
+    const isVeryRecent = Date.now() - latestMessage.timestamp < 3500;
+    
+    if (isVeryRecent && latestMessage.user.id !== currentUser.id) {
+       if (latestMessage.channelId !== activeChannelIdRef.current || !isWindowFocused.current) {
+         if (soundEnabledRef.current) {
+           playChime();
+         }
+         if (Notification.permission === "granted") {
+           const targetChanName = channels.find(c => c.id === latestMessage.channelId)?.name || 'channel';
+           showDesktopNotification(`New in #${targetChanName}`, { body: `${latestMessage.user.username}: ${latestMessage.content}` });
+         }
+         if (!isWindowFocused.current) {
+           const targetChanName = channels.find(c => c.id === latestMessage.channelId)?.name || 'channel';
+           startTabFlashing(`New in #${targetChanName}`);
+         }
+       }
+    }
+  }, [messages.length]);
+
   // Transmit typing activity telemetry
-  const reportTypingStatus = (typingState: boolean) => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
-        type: "typing",
+  const reportTypingStatus = async (typingState: boolean) => {
+    try {
+      const typingRef = doc(db, "typing", currentUser.id);
+      await setDoc(typingRef, {
         userId: currentUser.id,
         username: currentUser.username,
-        channelId: activeChannelId,
-        isTyping: typingState
-      }));
+        channelId: activeChannelIdRef.current,
+        isTyping: typingState,
+        lastUpdated: Date.now()
+      });
+    } catch (e) {
+      console.warn("Reporting telemetry typing status collapsed:", e);
     }
   };
 
@@ -323,7 +352,7 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!messageInput.trim() && !previewBase64) return;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (connectionStatus === "disconnected") return;
 
     let finalImageUrl: string | undefined = undefined;
 
@@ -366,11 +395,11 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
       reactions: []
     };
 
-    // Send via socket
-    socket.send(JSON.stringify({
-      type: "message",
-      message: newMessage
-    }));
+    try {
+      await setDoc(doc(db, "messages", newMessage.id), newMessage);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `messages/${newMessage.id}`);
+    }
 
     // ResetComposer
     setMessageInput("");
@@ -414,28 +443,52 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
     reader.readAsDataURL(file);
   };
 
-  // Trigger WS reaction toggle
-  const toggleReaction = (messageId: string, emoji: string) => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
-        type: "reaction",
-        messageId,
-        emoji,
-        userId: currentUser.id
-      }));
+  // Trigger Firestore reaction toggle
+  const toggleReaction = async (messageId: string, emoji: string) => {
+    const msgRef = doc(db, "messages", messageId);
+    const msgDoc = messages.find(m => m.id === messageId);
+    if (!msgDoc) return;
+
+    const currentReactions = msgDoc.reactions || [];
+    let nextReactions = [...currentReactions];
+
+    const existingReactionIndex = nextReactions.findIndex(r => r.emoji === emoji);
+    if (existingReactionIndex !== -1) {
+      const reaction = nextReactions[existingReactionIndex];
+      const userIndex = reaction.userIds.indexOf(currentUser.id);
+
+      if (userIndex !== -1) {
+        // Remove reaction
+        const newUserIds = reaction.userIds.filter(id => id !== currentUser.id);
+        if (newUserIds.length === 0) {
+          // Remove the group entire
+          nextReactions = nextReactions.filter(r => r.emoji !== emoji);
+        } else {
+          nextReactions[existingReactionIndex] = { ...reaction, userIds: newUserIds };
+        }
+      } else {
+        // Add user to reaction list
+        nextReactions[existingReactionIndex] = { ...reaction, userIds: [...reaction.userIds, currentUser.id] };
+      }
+    } else {
+      // Add completely new emoji reaction
+      nextReactions.push({ emoji, userIds: [currentUser.id] });
+    }
+
+    try {
+      await updateDoc(msgRef, { reactions: nextReactions });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `messages/${messageId}`);
     }
   };
 
   // Change self active status
-  const updateSelfStatus = (status: "online" | "away" | "offline") => {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
-        type: "status-update",
-        userId: currentUser.id,
-        status
-      }));
-      // Instantly optimize local view
-      setUsers(prev => prev.map(u => u.id === currentUser.id ? { ...u, status } : u));
+  const updateSelfStatus = async (status: "online" | "away" | "offline") => {
+    try {
+      const userDoc = doc(db, "users", currentUser.id);
+      await updateDoc(userDoc, { status, lastActive: Date.now() });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `users/${currentUser.id}`);
     }
   };
 
@@ -449,26 +502,29 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
       return;
     }
 
+    const newChannelId = cleanName;
+
+    // Check if channel already exists
+    if (channels.some(c => c.id === newChannelId)) {
+      setChannelError("Channel name is occupied.");
+      return;
+    }
+
+    const newChannel: Channel = {
+      id: newChannelId,
+      name: cleanName,
+      description: newChannelDesc.trim() || `Channel focused on ${cleanName}.`
+    };
+
     try {
-      const res = await fetch("/api/channels", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: cleanName, description: newChannelDesc })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setChannelError(data.error || "Could not register channel.");
-      } else {
-        // Success
-        setShowChannelModal(false);
-        setNewChannelName("");
-        setNewChannelDesc("");
-        setActiveChannelId(data.id);
-        setSidebarOpen(false); // Close mobile tray
-      }
+      await setDoc(doc(db, "channels", newChannelId), newChannel);
+      setShowChannelModal(false);
+      setNewChannelName("");
+      setNewChannelDesc("");
+      setActiveChannelId(newChannelId);
+      setSidebarOpen(false); // Close mobile tray
     } catch (err) {
-      console.error(err);
-      setChannelError("Failed connecting to channels service.");
+      handleFirestoreError(err, OperationType.WRITE, `channels/${newChannelId}`);
     }
   };
 
@@ -496,31 +552,6 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
   return (
     <div className="h-screen w-full flex bg-[#0a0a0a] text-stone-300 font-sans tracking-normal overflow-hidden select-none">
       
-      {/* Absolute Push notifications permission banner pop-up to enable device badges */}
-      {!hasNotificationPermission && "Notification" in window && (
-        <div className="absolute top-2 right-2 z-50 max-w-sm bg-[#0f0f0f] border border-indigo-500/30 rounded-xl p-3.5 shadow-xl flex items-start gap-3">
-          <Bell className="h-5 w-5 text-indigo-400 mt-0.5 shrink-0" />
-          <div className="flex-1">
-            <h4 className="text-xs font-bold text-white">Toggle Push Notifications?</h4>
-            <p className="text-[11px] text-stone-400 mt-0.5">Stay responsive to team mentions and workspace messages when backgrounded.</p>
-            <div className="flex gap-2 mt-2">
-              <button 
-                onClick={requestNotificationPermission} 
-                className="px-2.5 py-1 text-[11px] font-semibold bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition-transform hover:scale-105 active:scale-95 cursor-pointer"
-              >
-                Enable
-              </button>
-              <button 
-                onClick={() => setHasNotificationPermission(true)} 
-                className="px-2 py-1 text-[10px] font-medium text-stone-500 hover:bg-white/5 rounded-lg cursor-pointer"
-              >
-                Never Ask
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* MOBILE HEADER BAR TRIGGER (HIDDEN ON DESKTOP) */}
       <div className="md:hidden absolute top-3.5 left-4 z-40">
         <button 
