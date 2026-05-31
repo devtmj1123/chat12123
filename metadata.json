@@ -1,0 +1,6 @@
+{
+  "name": "Full Stack Chat App",
+  "description": "A real-time full-stack chat application with support for custom channels, file sharing, desktop notifications, real-time presence indicators, typing feedback, and built-in AI assistance powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
