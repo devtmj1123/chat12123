@@ -593,6 +593,30 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
     return channelMsgs[channelMsgs.length - 1];
   };
 
+  // Check if all recipients have viewed the message, using the existing seenBy array field
+  const hasAllRecipientsSeen = (msg: Message) => {
+    if (!msg) return false;
+    if (msg.isSystem) return true;
+    
+    const currentSeenBy = msg.seenBy || [];
+
+    // If it's a DM (e.g. dm-userA-userB)
+    if (msg.channelId.startsWith("dm-")) {
+      const parts = msg.channelId.split("-");
+      if (parts.length >= 3) {
+        const recipientId = parts[1] === msg.user.id ? parts[2] : parts[1];
+        return currentSeenBy.includes(recipientId);
+      }
+    }
+
+    // Fallback for standard groups/channels: all other users in space except the sender
+    const otherRecipients = users.filter(
+      (u) => u.id !== msg.user.id && u.id !== "assistant" && u.id !== "system"
+    );
+    if (otherRecipients.length === 0) return true;
+    return otherRecipients.every((u) => currentSeenBy.includes(u.id));
+  };
+
   // Apply real-time client filter search
   const filteredMessages = activeChannelMessages.filter(m => {
     if (!searchQuery.substring(0, 50).trim()) return true;
@@ -741,8 +765,8 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
                           ) : latestMsg ? (
                             <>
                               {latestMsg.user.id === currentUser.id && (
-                                <span className={`text-[11px] font-bold shrink-0 leading-none ${latestMsg.seenBy?.includes(u.id) ? "text-[#53bdeb]" : "text-[#8696a0]"}`}>
-                                  {latestMsg.seenBy?.includes(u.id) ? "✓✓" : u.status === "online" ? "✓✓" : "✓"}
+                                <span className={`text-[11px] font-bold font-mono shrink-0 leading-none ${hasAllRecipientsSeen(latestMsg) ? "text-[#53bdeb]" : "text-[#8696a0]"}`}>
+                                  {hasAllRecipientsSeen(latestMsg) ? "✓✓" : u.status === "online" ? "✓✓" : "✓"}
                                 </span>
                               )}
                               <span className="font-semibold text-stone-400">
@@ -1009,12 +1033,12 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
                             </span>
                             {isSelf && (
                               <>
-                                {msg.seenBy?.includes(dmRecipient?.id || "") ? (
-                                  <span className="text-[#53bdeb] text-[11px] leading-none font-bold" title="Seen">✓✓</span>
+                                {hasAllRecipientsSeen(msg) ? (
+                                  <span className="text-[#53bdeb] text-[11px] leading-none font-bold font-mono" title="Seen">✓✓</span>
                                 ) : dmRecipient?.status === "online" ? (
-                                  <span className="text-[#8696a0]/90 text-[11px] leading-none font-medium" title="Delivered">✓✓</span>
+                                  <span className="text-[#8696a0]/90 text-[11px] leading-none font-medium font-mono" title="Delivered">✓✓</span>
                                 ) : (
-                                  <span className="text-[#8696a0]/90 text-[11px] leading-none font-medium" title="Sent">✓</span>
+                                  <span className="text-[#8696a0]/90 text-[11px] leading-none font-medium font-mono" title="Sent">✓</span>
                                 )}
                               </>
                             )}
