@@ -151,6 +151,37 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
     activeChannelIdRef.current = activeChannelId;
   }, [activeChannelId]);
 
+  // Real-time synchronization to mark messages as seen/read in database
+  useEffect(() => {
+    if (!activeChannelId) return;
+
+    const markMessagesAsSeen = async () => {
+      const unseenMessages = messages.filter(
+        (m) =>
+          m.channelId === activeChannelId &&
+          m.user.id !== currentUser.id &&
+          (!m.seenBy || !m.seenBy.includes(currentUser.id))
+      );
+
+      if (unseenMessages.length === 0) return;
+
+      try {
+        const batchPromises = unseenMessages.map((m) => {
+          const mRef = doc(db, "messages", m.id);
+          const currentSeen = m.seenBy || [];
+          return updateDoc(mRef, {
+            seenBy: Array.from(new Set([...currentSeen, currentUser.id]))
+          });
+        });
+        await Promise.all(batchPromises);
+      } catch (err) {
+        console.warn("Failed marking messages as read/seen in Firestore:", err);
+      }
+    };
+
+    markMessagesAsSeen();
+  }, [activeChannelId, messages, currentUser.id]);
+
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
@@ -664,6 +695,10 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
                 const dmId = getDMChannelId(currentUser.id, u.id);
                 const isActive = activeChannelId === dmId;
                 const latestMsg = getLatestMessageForChannel(dmId);
+                const isTypingInDM = typingUsers[u.id] && typingUsers[u.id].channelId === dmId;
+                const unseenCount = messages.filter(
+                  m => m.channelId === dmId && m.user.id === u.id && (!m.seenBy || !m.seenBy.includes(currentUser.id))
+                ).length;
 
                 return (
                   <button
@@ -693,27 +728,39 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
                           <span className="text-[9px] font-mono text-[#00a884] shrink-0 font-bold">(You)</span>
                         ) : (
                           latestMsg && (
-                            <span className="text-[9px] text-[#8696a0] font-mono shrink-0">
+                            <span className={`text-[9px] font-mono shrink-0 ${unseenCount > 0 ? "text-[#00e676] font-bold" : "text-[#8696a0]"}`}>
                               {new Date(latestMsg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                             </span>
                           )
                         )}
                       </div>
-                      <p className="text-[10px] text-[#8696a0] truncate flex items-center gap-1">
-                        {latestMsg ? (
-                          <>
-                            {latestMsg.user.id === currentUser.id && (
-                              <span className="text-[#53bdeb] text-[10px] font-bold shrink-0">✓✓</span>
-                            )}
-                            <span className="font-semibold text-stone-400">
-                              {latestMsg.user.id === currentUser.id ? "You" : latestMsg.user.username}:
-                            </span>
-                            <span className="truncate">{latestMsg.content || "📷 Image attachment"}</span>
-                          </>
-                        ) : (
-                          <span className="capitalize">{u.status === "online" ? "online" : u.status === "away" ? "away" : "offline"}</span>
+                      <div className="flex items-center justify-between gap-1.5 overflow-hidden">
+                        <p className="text-[10px] text-[#8696a0] truncate flex-1 min-w-0 flex items-center gap-1">
+                          {isTypingInDM ? (
+                            <span className="text-[#00e676] font-bold animate-pulse">typing...</span>
+                          ) : latestMsg ? (
+                            <>
+                              {latestMsg.user.id === currentUser.id && (
+                                <span className={`text-[11px] font-bold shrink-0 leading-none ${latestMsg.seenBy?.includes(u.id) ? "text-[#53bdeb]" : "text-[#8696a0]"}`}>
+                                  {latestMsg.seenBy?.includes(u.id) ? "✓✓" : u.status === "online" ? "✓✓" : "✓"}
+                                </span>
+                              )}
+                              <span className="font-semibold text-stone-400">
+                                {latestMsg.user.id === currentUser.id ? "You" : latestMsg.user.username}:
+                              </span>
+                              <span className="truncate">{latestMsg.content || "📷 Image attachment"}</span>
+                            </>
+                          ) : (
+                            <span className="capitalize">{u.status === "online" ? "online" : u.status === "away" ? "away" : "offline"}</span>
+                          )}
+                        </p>
+                        
+                        {!isSelf && unseenCount > 0 && (
+                          <span className="h-4.5 min-w-4.5 px-1 rounded-full bg-[#00a884] flex items-center justify-center text-[9px] text-[#111b21] font-bold font-mono shrink-0 shadow-[0_1px_3px_rgba(0,168,132,0.4)]">
+                            {unseenCount}
+                          </span>
                         )}
-                      </p>
+                      </div>
                     </div>
                   </button>
                 );
@@ -961,7 +1008,15 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
                               {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                             </span>
                             {isSelf && (
-                              <span className="text-[#53bdeb] text-[11px] leading-none font-bold">✓✓</span>
+                              <>
+                                {msg.seenBy?.includes(dmRecipient?.id || "") ? (
+                                  <span className="text-[#53bdeb] text-[11px] leading-none font-bold" title="Seen">✓✓</span>
+                                ) : dmRecipient?.status === "online" ? (
+                                  <span className="text-[#8696a0]/90 text-[11px] leading-none font-medium" title="Delivered">✓✓</span>
+                                ) : (
+                                  <span className="text-[#8696a0]/90 text-[11px] leading-none font-medium" title="Sent">✓</span>
+                                )}
+                              </>
                             )}
                           </div>
                         </div>
@@ -1013,6 +1068,28 @@ export const ChatLayout: React.FC<ChatLayoutProps> = ({ currentUser, onLogout })
                   );
                 })}
               </AnimatePresence>
+
+              {/* Typing status bubble inside the feed */}
+              {isDM && dmRecipient && Object.values(typingUsers).some((t: any) => t.channelId === activeChannelId) && (
+                <motion.div
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 8 }}
+                  transition={{ duration: 0.1 }}
+                  className="flex items-start gap-2.5 selecting-none animate-none"
+                >
+                  <div className="shrink-0 self-start mt-0.5">
+                    <AvatarIcon user={dmRecipient} size="sm" showStatus={false} />
+                  </div>
+                  <div className="flex flex-col">
+                    <div className="bg-[#202c33] rounded-2.5xl rounded-tl-none px-4 py-3 shadow-[0_1.2px_0.8px_rgba(0,0,0,0.18)] flex items-center gap-1.5 min-w-[70px]">
+                      <span className="w-2 h-2 bg-[#8696a0] rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+                      <span className="w-2 h-2 bg-[#8696a0] rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+                      <span className="w-2 h-2 bg-[#8696a0] rounded-full animate-bounce"></span>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
             </div>
           )}
           <div ref={messagesEndRef} />

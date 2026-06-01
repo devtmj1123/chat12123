@@ -21,6 +21,7 @@ export interface Message {
   imageUrl?: string; // Optional image URL for file uploads
   reactions: Reaction[];
   isSystem?: boolean;
+  seenBy?: string[];
 }
 
 export interface Channel {
