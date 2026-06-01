@@ -18,10 +18,10 @@ const colorMap: Record<string, string> = {
 };
 
 const sizeClasses = {
-  sm: "h-8 w-8 text-sm rounded-lg",
-  md: "h-10 w-10 text-base rounded-xl",
-  lg: "h-14 w-14 text-xl rounded-2xl",
-  xl: "h-20 w-20 text-3xl rounded-3xl",
+  sm: "h-8 w-8 text-sm rounded-full",
+  md: "h-10 w-10 text-base rounded-full",
+  lg: "h-14 w-14 text-xl rounded-full",
+  xl: "h-20 w-20 text-3xl rounded-full",
 };
 
 const statusColors = {
